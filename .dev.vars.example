@@ -1,0 +1,5 @@
+# Cloudflare Worker Local Environment Secrets (.dev.vars)
+# Used by Wrangler during local development: wrangler dev
+
+SUPABASE_URL="https://your-assetmt-project.supabase.co"
+SUPABASE_ANON_KEY="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."

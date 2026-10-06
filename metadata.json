@@ -1,0 +1,6 @@
+{
+  "name": "AssetMT",
+  "description": "AssetMT - Commercial multi-tenant enterprise asset management SaaS by Akshigo Tech",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
