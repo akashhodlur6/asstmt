@@ -266,7 +266,7 @@ export async function runMultiTenantIsolationTests(): Promise<{ passed: number; 
   );
 
   // --------------------------------------------------------------------------
-  // 9. DOCUMENT & STORAGE ISOLATION
+  // 9. DOCUMENT & STORAGE ISOLATION (SUPABASE STORAGE: assetmt-files)
   // --------------------------------------------------------------------------
   assert(
     workerCode.includes("docDownloadMatch") &&
@@ -276,8 +276,10 @@ export async function runMultiTenantIsolationTests(): Promise<{ passed: number; 
   );
 
   assert(
-    workerCode.includes("tenants/${tenantId}/documents/"),
-    'Storage Scoping: R2 object storage keys are strictly partitioned by tenants/${tenantId}/'
+    workerCode.includes("tenants/${tenantId}/documents/") &&
+      workerCode.includes("SUPABASE_STORAGE_BUCKET = 'assetmt-files'") &&
+      !workerCode.includes("env.STORAGE_BUCKET"),
+    'Storage Scoping: Supabase Storage (assetmt-files) object keys are strictly partitioned by tenants/${tenantId}/ with no R2 dependency'
   );
 
   // --------------------------------------------------------------------------

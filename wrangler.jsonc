@@ -12,12 +12,6 @@
     "html_handling": "auto-trailing-slash",
     "not_found_handling": "single-page-application"
   },
-  "r2_buckets": [
-    {
-      "binding": "STORAGE_BUCKET",
-      "bucket_name": "assetmt-production-storage"
-    }
-  ],
   "vars": {
     "ENVIRONMENT": "production"
   }

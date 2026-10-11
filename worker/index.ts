@@ -178,9 +178,9 @@ export interface Env {
   PLATFORM_ADMIN_USER_ID?: string;
   AKSHIGO_INTEGRATION_SECRET?: string;
   RESEND_API_KEY?: string;
-  STORAGE_BUCKET?: any;
-  R2_BUCKET?: any;
 }
+
+export const SUPABASE_STORAGE_BUCKET = 'assetmt-files';
 
 interface AuthContext {
   user: User;
@@ -206,7 +206,7 @@ function checkRateLimit(key: string, limit: number, windowMs = 60000): { allowed
   return { allowed: true };
 }
 
-// In-Memory Storage Fallback (when external R2 is not yet bound in development)
+// In-Memory Storage Fallback (used only in non-production local/unit test runs)
 const memoryStorageStore = new Map<string, { data: Uint8Array; contentType: string }>();
 
 function getSecurityHeaders(): Record<string, string> {
@@ -5292,14 +5292,50 @@ export default {
       }
 
       if (subpath === '/documents' && request.method === 'POST') {
+        if (!canMutateTenantBusinessData((membership?.company as any)?.status)) {
+          return jsonResponse(
+            { success: false, error: 'TENANT_SUSPENDED', message: 'Workspace is suspended. Document uploads are blocked.' },
+            403
+          );
+        }
+
         const body = (await request.json().catch(() => ({}))) as Partial<CreateDocumentInput>;
         const validation = validateDocumentMetadata(body);
         if (!validation.isValid) {
           return jsonResponse({ success: false, error: 'VALIDATION_ERROR', errors: validation.errors }, 400);
         }
 
-        const safeFilename = body.original_filename!.replace(/[^a-zA-Z0-9_.-]/g, '_');
-        const storedPath = `documents/${tenantId}/${body.entity_type}/${body.entity_id}/${Date.now()}_${safeFilename}`;
+        const safeFilename = sanitizeFilename(body.original_filename!);
+        const storedPath = `tenants/${tenantId}/documents/${crypto.randomUUID()}_${safeFilename}`;
+        const mimeType = body.content_type || 'application/octet-stream';
+
+        if (body.file_data_base64) {
+          const binaryStr = atob(body.file_data_base64);
+          const fileBuffer = new Uint8Array(binaryStr.length);
+          for (let i = 0; i < binaryStr.length; i++) {
+            fileBuffer[i] = binaryStr.charCodeAt(i);
+          }
+          const uploadVal = validateStorageUpload({ filename: safeFilename, size: fileBuffer.length, mimeType }, 'DOCUMENT');
+          if (!uploadVal.isValid) {
+            return jsonResponse({ success: false, error: 'VALIDATION_ERROR', errors: uploadVal.errors }, 400);
+          }
+          const { error: storageErr } = await client.storage
+            .from(SUPABASE_STORAGE_BUCKET)
+            .upload(storedPath, fileBuffer, { contentType: mimeType, upsert: false });
+
+          if (storageErr && env.ENVIRONMENT !== 'production') {
+            memoryStorageStore.set(storedPath, { data: fileBuffer, contentType: mimeType });
+          } else if (storageErr && env.ENVIRONMENT === 'production') {
+            return jsonResponse(
+              {
+                success: false,
+                error: 'STORAGE_UNAVAILABLE',
+                message: storageErr.message || 'Supabase Storage bucket "assetmt-files" is not configured or accessible.',
+              },
+              503
+            );
+          }
+        }
 
         const { data: created, error: cErr } = await client
           .from('documents')
@@ -5307,9 +5343,10 @@ export default {
             company_id: tenantId,
             entity_type: body.entity_type!,
             entity_id: body.entity_id!,
-            original_filename: body.original_filename!.trim(),
+            original_filename: safeFilename,
             stored_path: storedPath,
-            content_type: body.content_type || 'application/octet-stream',
+            storage_key: storedPath,
+            content_type: mimeType,
             file_size: Number(body.file_size) || 0,
             uploaded_by: user.id,
             description: body.description?.trim() || null,
@@ -5329,7 +5366,8 @@ export default {
             document_id: created.id,
             entity_type: body.entity_type,
             entity_id: body.entity_id,
-            filename: body.original_filename,
+            filename: safeFilename,
+            storage_key: storedPath,
             file_size: body.file_size,
           },
         });
@@ -5339,14 +5377,38 @@ export default {
 
       const docDeleteMatch = subpath.match(/^\/documents\/([a-zA-Z0-9_-]+)$/);
       if (docDeleteMatch && request.method === 'DELETE') {
-        if (membership.role !== 'TENANT_ADMIN') {
+        if (!isTenantAdmin(membership.role)) {
           return jsonResponse(
             { success: false, error: 'FORBIDDEN', message: 'Only Tenant Admins are authorized to delete documents.' },
             403
           );
         }
 
+        if (!canMutateTenantBusinessData((membership?.company as any)?.status)) {
+          return jsonResponse(
+            { success: false, error: 'TENANT_SUSPENDED', message: 'Workspace is suspended. Document deletion is blocked.' },
+            403
+          );
+        }
+
         const docId = docDeleteMatch[1];
+        const { data: existingDoc } = await client
+          .from('documents')
+          .select('*')
+          .eq('id', docId)
+          .eq('company_id', tenantId)
+          .maybeSingle();
+
+        if (!existingDoc) {
+          return jsonResponse({ success: false, error: 'NOT_FOUND', message: 'Document not found' }, 404);
+        }
+
+        const storageKey = existingDoc.storage_key || existingDoc.stored_path;
+        if (storageKey && storageKey.startsWith(`tenants/${tenantId}/`)) {
+          await client.storage.from(SUPABASE_STORAGE_BUCKET).remove([storageKey]);
+          memoryStorageStore.delete(storageKey);
+        }
+
         const { error: delErr } = await client
           .from('documents')
           .delete()
@@ -7031,39 +7093,46 @@ export default {
 
         const storageKey = `tenants/${tenantId}/documents/${crypto.randomUUID()}_${cleanName}`;
 
-        // Save to R2 bucket if bound, else fallback store in dev only
-        const bucket = env.STORAGE_BUCKET || env.R2_BUCKET;
-        if (bucket && typeof bucket.put === 'function') {
-          await bucket.put(storageKey, fileBuffer, {
-            httpMetadata: { contentType },
-            customMetadata: { tenantId, entityType, entityId, uploadedBy: user.id },
+        // Save binary to private Supabase Storage bucket "assetmt-files" (tenant-partitioned)
+        const { error: storageUploadErr } = await client.storage
+          .from(SUPABASE_STORAGE_BUCKET)
+          .upload(storageKey, fileBuffer, {
+            contentType,
+            upsert: false,
           });
-        } else if (env.ENVIRONMENT === 'production') {
-          return jsonResponse(
-            {
-              success: false,
-              error: 'STORAGE_UNAVAILABLE',
-              message: 'Cloudflare R2 production storage is not configured or bound to this deployment.',
-            },
-            503
-          );
-        } else {
-          memoryStorageStore.set(storageKey, { data: fileBuffer, contentType });
+
+        if (storageUploadErr) {
+          if (env.ENVIRONMENT === 'production') {
+            return jsonResponse(
+              {
+                success: false,
+                error: 'STORAGE_UNAVAILABLE',
+                message: storageUploadErr.message || 'Supabase Storage bucket "assetmt-files" is not configured or accessible.',
+              },
+              503
+            );
+          } else {
+            memoryStorageStore.set(storageKey, { data: fileBuffer, contentType });
+          }
         }
+
+        const safeEntityId =
+          entityId && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(entityId)
+            ? entityId
+            : '00000000-0000-0000-0000-000000000000';
 
         const { data: docRecord, error: docErr } = await client
           .from('documents')
           .insert({
             company_id: tenantId,
             entity_type: entityType,
-            entity_id: entityId || 'workspace-global',
-            document_type: documentType,
+            entity_id: safeEntityId,
             original_filename: cleanName,
-            storage_path: storageKey,
+            stored_path: storageKey,
             storage_key: storageKey,
             file_size: fileBuffer.length,
             content_type: contentType,
-            notes: notes || null,
+            description: notes ? `[${documentType}] ${notes}` : documentType,
             uploaded_by: user.id,
           })
           .select()
@@ -7075,11 +7144,11 @@ export default {
 
         await client.from('asset_events').insert({
           company_id: tenantId,
-          asset_id: entityType === 'ASSET' ? entityId : null,
+          asset_id: entityType === 'ASSET' && safeEntityId !== '00000000-0000-0000-0000-000000000000' ? safeEntityId : null,
           event_type: 'DOCUMENT_ADDED',
           actor_id: user.id,
           notes: `Uploaded document "${cleanName}" (${(fileBuffer.length / 1024).toFixed(1)} KB)`,
-          details: { document_id: docRecord.id, storage_key: storageKey, content_type: contentType },
+          details: { document_id: docRecord.id, storage_key: storageKey, bucket: SUPABASE_STORAGE_BUCKET, content_type: contentType },
         });
 
         const uploadRes: StorageUploadResponse = {
@@ -7110,16 +7179,22 @@ export default {
           return jsonResponse({ success: false, error: 'NOT_FOUND', message: 'Document not found or unauthorized' }, 404);
         }
 
-        const storageKey = doc.storage_key || doc.storage_path;
-        const bucket = env.STORAGE_BUCKET || env.R2_BUCKET;
+        const storageKey: string = doc.storage_key || doc.stored_path || doc.storage_path || '';
+        if (storageKey.startsWith('tenants/') && !storageKey.startsWith(`tenants/${tenantId}/`)) {
+          return jsonResponse({ success: false, error: 'FORBIDDEN', message: 'Cross-tenant storage object access denied' }, 403);
+        }
+
         let fileData: Uint8Array | null = null;
         let mime = doc.content_type || 'application/octet-stream';
 
-        if (bucket && typeof bucket.get === 'function') {
-          const r2Obj = await bucket.get(storageKey);
-          if (r2Obj) {
-            fileData = new Uint8Array(await r2Obj.arrayBuffer());
-            if (r2Obj.httpMetadata?.contentType) mime = r2Obj.httpMetadata.contentType;
+        if (storageKey) {
+          const { data: storageBlob, error: downloadErr } = await client.storage
+            .from(SUPABASE_STORAGE_BUCKET)
+            .download(storageKey);
+
+          if (!downloadErr && storageBlob) {
+            fileData = new Uint8Array(await storageBlob.arrayBuffer());
+            if (storageBlob.type) mime = storageBlob.type;
           }
         }
 
@@ -7137,7 +7212,7 @@ export default {
               {
                 success: false,
                 error: 'STORAGE_UNAVAILABLE',
-                message: 'Document binary object could not be found in Cloudflare R2 production storage.',
+                message: 'Document binary object could not be retrieved from private Supabase Storage bucket "assetmt-files".',
               },
               503
             );
@@ -7154,6 +7229,20 @@ export default {
       // Delete binary document
       const docStorageDeleteMatch = subpath.match(/^\/documents\/([a-zA-Z0-9_-]+)\/storage$/);
       if (docStorageDeleteMatch && request.method === 'DELETE') {
+        if (!isTenantAdmin(membership.role)) {
+          return jsonResponse(
+            { success: false, error: 'FORBIDDEN', message: 'Only Tenant Admins are authorized to delete documents from storage.' },
+            403
+          );
+        }
+
+        if (!canMutateTenantBusinessData((membership?.company as any)?.status)) {
+          return jsonResponse(
+            { success: false, error: 'TENANT_SUSPENDED', message: 'Workspace is suspended. Document deletion is blocked.' },
+            403
+          );
+        }
+
         const docId = docStorageDeleteMatch[1];
         const { data: doc } = await client
           .from('documents')
@@ -7166,12 +7255,15 @@ export default {
           return jsonResponse({ success: false, error: 'NOT_FOUND', message: 'Document not found' }, 404);
         }
 
-        const storageKey = doc.storage_key || doc.storage_path;
-        const bucket = env.STORAGE_BUCKET || env.R2_BUCKET;
-        if (bucket && typeof bucket.delete === 'function') {
-          await bucket.delete(storageKey);
+        const storageKey: string = doc.storage_key || doc.stored_path || doc.storage_path || '';
+        if (storageKey.startsWith('tenants/') && !storageKey.startsWith(`tenants/${tenantId}/`)) {
+          return jsonResponse({ success: false, error: 'FORBIDDEN', message: 'Cross-tenant storage deletion denied' }, 403);
         }
-        memoryStorageStore.delete(storageKey);
+
+        if (storageKey) {
+          await client.storage.from(SUPABASE_STORAGE_BUCKET).remove([storageKey]);
+          memoryStorageStore.delete(storageKey);
+        }
 
         await client.from('documents').delete().eq('id', docId).eq('company_id', tenantId);
 
@@ -7179,12 +7271,19 @@ export default {
       }
 
       // ======================================================================
-      // PHASE 7: REAL TENANT LOGO STORAGE
+      // PHASE 7: REAL TENANT LOGO STORAGE (SUPABASE STORAGE)
       // ======================================================================
       if (subpath === '/tenant-settings/logo' && request.method === 'POST') {
         if (!isTenantAdmin(membership.role)) {
           return jsonResponse(
             { success: false, error: 'FORBIDDEN', message: 'Only Tenant Admins are authorized to update tenant branding.' },
+            403
+          );
+        }
+
+        if (!canMutateTenantBusinessData((membership?.company as any)?.status)) {
+          return jsonResponse(
+            { success: false, error: 'TENANT_SUSPENDED', message: 'Workspace is suspended. Branding updates are blocked.' },
             403
           );
         }
@@ -7236,23 +7335,26 @@ export default {
         }
 
         const storageKey = `tenants/${tenantId}/branding/${crypto.randomUUID()}_${cleanName}`;
-        const bucket = env.STORAGE_BUCKET || env.R2_BUCKET;
-        if (bucket && typeof bucket.put === 'function') {
-          await bucket.put(storageKey, fileBuffer, {
-            httpMetadata: { contentType },
-            customMetadata: { tenantId, type: 'logo', uploadedBy: user.id },
+        const { error: logoUploadErr } = await client.storage
+          .from(SUPABASE_STORAGE_BUCKET)
+          .upload(storageKey, fileBuffer, {
+            contentType,
+            upsert: false,
           });
-        } else if (env.ENVIRONMENT === 'production') {
-          return jsonResponse(
-            {
-              success: false,
-              error: 'STORAGE_UNAVAILABLE',
-              message: 'Cloudflare R2 production storage is not configured or bound to this deployment.',
-            },
-            503
-          );
-        } else {
-          memoryStorageStore.set(storageKey, { data: fileBuffer, contentType });
+
+        if (logoUploadErr) {
+          if (env.ENVIRONMENT === 'production') {
+            return jsonResponse(
+              {
+                success: false,
+                error: 'STORAGE_UNAVAILABLE',
+                message: logoUploadErr.message || 'Supabase Storage bucket "assetmt-files" is not configured or accessible.',
+              },
+              503
+            );
+          } else {
+            memoryStorageStore.set(storageKey, { data: fileBuffer, contentType });
+          }
         }
 
         // Clean up old logo storage key if exists
@@ -7262,10 +7364,8 @@ export default {
           .eq('company_id', tenantId)
           .maybeSingle();
 
-        if (currentSettings?.logo_storage_path) {
-          if (bucket && typeof bucket.delete === 'function') {
-            await bucket.delete(currentSettings.logo_storage_path);
-          }
+        if (currentSettings?.logo_storage_path && currentSettings.logo_storage_path.startsWith(`tenants/${tenantId}/`)) {
+          await client.storage.from(SUPABASE_STORAGE_BUCKET).remove([currentSettings.logo_storage_path]);
           memoryStorageStore.delete(currentSettings.logo_storage_path);
         }
 
@@ -7300,16 +7400,20 @@ export default {
           return jsonResponse({ success: false, error: 'NOT_FOUND', message: 'No custom logo configured' }, 404);
         }
 
-        const bucket = env.STORAGE_BUCKET || env.R2_BUCKET;
+        if (sett.logo_storage_path.startsWith('tenants/') && !sett.logo_storage_path.startsWith(`tenants/${tenantId}/`)) {
+          return jsonResponse({ success: false, error: 'FORBIDDEN', message: 'Cross-tenant branding access denied' }, 403);
+        }
+
         let fileData: Uint8Array | null = null;
         let mime = 'image/png';
 
-        if (bucket && typeof bucket.get === 'function') {
-          const r2Obj = await bucket.get(sett.logo_storage_path);
-          if (r2Obj) {
-            fileData = new Uint8Array(await r2Obj.arrayBuffer());
-            if (r2Obj.httpMetadata?.contentType) mime = r2Obj.httpMetadata.contentType;
-          }
+        const { data: logoBlob, error: logoDownloadErr } = await client.storage
+          .from(SUPABASE_STORAGE_BUCKET)
+          .download(sett.logo_storage_path);
+
+        if (!logoDownloadErr && logoBlob) {
+          fileData = new Uint8Array(await logoBlob.arrayBuffer());
+          if (logoBlob.type) mime = logoBlob.type;
         }
 
         if (!fileData && env.ENVIRONMENT !== 'production') {

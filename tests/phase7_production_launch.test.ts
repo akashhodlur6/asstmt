@@ -3,6 +3,8 @@
  * Commercial Multi-Tenant Asset-Management SaaS by Akshigo Tech
  */
 
+import fs from 'node:fs';
+import path from 'node:path';
 import {
   sanitizeFilename,
   validateStorageUpload,
@@ -309,6 +311,31 @@ export async function runPhase7ProductionLaunchTests(): Promise<{ passed: number
   assert(
     !expiredPayload.isValid && Boolean(expiredPayload.errors.timestamp),
     'expired request fails'
+  );
+
+  // --------------------------------------------------------------------------
+  // 7. Free Cloudflare + Supabase Storage Architecture Invariants
+  // --------------------------------------------------------------------------
+  const wranglerConfig = fs.readFileSync(path.resolve('wrangler.jsonc'), 'utf-8');
+  assert(
+    !wranglerConfig.includes('r2_buckets') && !wranglerConfig.includes('STORAGE_BUCKET'),
+    'wrangler.jsonc has no Cloudflare R2 bucket binding requirement'
+  );
+
+  const workerSource = fs.readFileSync(path.resolve('worker/index.ts'), 'utf-8');
+  assert(
+    workerSource.includes("SUPABASE_STORAGE_BUCKET = 'assetmt-files'") &&
+      !workerSource.includes('env.STORAGE_BUCKET') &&
+      !workerSource.includes('env.R2_BUCKET'),
+    'Worker uses private Supabase Storage bucket assetmt-files with zero R2 dependency'
+  );
+
+  const storageMigration = fs.readFileSync(path.resolve('migrations/0012_supabase_storage_bucket.sql'), 'utf-8');
+  assert(
+    storageMigration.includes("'assetmt-files'") &&
+      storageMigration.includes('false') &&
+      storageMigration.includes('public.storage_object_company_id(name)'),
+    'Migration 0012 provisions private assetmt-files bucket with tenant-partitioned RLS policies'
   );
 
   return { passed, failed, tests };
